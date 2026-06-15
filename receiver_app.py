@@ -53,7 +53,7 @@ TITLEBAR_SNAP_THRESHOLD = 80    # wider snap radius inside that zone
 # track a floating-point cursor position and ease it toward the desired target
 # each update. The "pull" blends the raw position and the snap target so the
 # cursor glides toward controls magnetically rather than jumping onto them.
-MOVE_SMOOTHING_DEFAULT = 0.35   # 0 = no movement, 1 = instant jump (per update)
+MOVE_SMOOTHING_DEFAULT = 0.80   # 0 = no movement, 1 = instant jump (per update)
 SNAP_PULL_STRENGTH = 0.55       # how strongly a detected control pulls the cursor toward it
 CURSOR_RESYNC_THRESHOLD = 80    # px — if real cursor drifts this far from our tracked
                                 # position (e.g. user grabbed the mouse), resync to it
@@ -238,7 +238,7 @@ class SerialWorker(threading.Thread):
 
         elif cmd == "SCROLL" and len(parts) == 3:
             direction = parts[1].upper()
-            amount = int(parts[2])
+            amount    = int(float(parts[2]))
             if direction == "UP":
                 pyautogui.scroll(amount)
             elif direction == "DOWN":
@@ -354,6 +354,10 @@ class Overlay(tk.Toplevel):
         "disconnected": "Disconnected",
     }
 
+    CORNER_MARGIN = 50      # px gap from screen edge
+    AVOID_MARGIN = 60       # px — how close the cursor must get before we relocate
+    AVOID_POLL_MS = 150     # how often to check the cursor position
+
     def __init__(self, master):
         super().__init__(master)
         self.overrideredirect(True)
@@ -370,16 +374,40 @@ class Overlay(tk.Toplevel):
                               font=("Segoe UI", 10))
         self.label.grid(row=0, column=1, padx=(0, pad), pady=pad)
 
-        self._place_top_right()
+        self.current_corner = "top-right"
+        self._place_corner("top-right")
+
         self.bind("<Button-1>", self._start_drag)
         self.bind("<B1-Motion>", self._drag)
+        self.bind("<ButtonRelease-1>", self._end_drag)
 
-    def _place_top_right(self):
+        self.after(self.AVOID_POLL_MS, self._avoid_cursor)
+
+    # --- positioning -----------------------------------------------------
+    def _corner_positions(self):
         self.update_idletasks()
+        w = self.winfo_width() or self.winfo_reqwidth()
+        h = self.winfo_height() or self.winfo_reqheight()
         sw = self.winfo_screenwidth()
-        w = self.winfo_reqwidth()
-        self.geometry(f"+{sw - w - 20}+20")
+        sh = self.winfo_screenheight()
+        m = self.CORNER_MARGIN
+        return {
+            "top-right": (sw - w - m, m),
+            "top-left": (m, m),
+            "bottom-right": (sw - w - m, sh - h - m),
+            "bottom-left": (m, sh - h - m),
+        }
 
+    def _place_corner(self, name):
+        x, y = self._corner_positions()[name]
+        self.geometry(f"+{x}+{y}")
+        self.current_corner = name
+
+    def _nearest_corner(self, x, y):
+        positions = self._corner_positions()
+        return min(positions.items(), key=lambda kv: _distance(x, y, *kv[1]))[0]
+
+    # --- dragging ----------------------------------------------------------
     def _start_drag(self, event):
         self._drag_x, self._drag_y = event.x, event.y
 
@@ -387,6 +415,36 @@ class Overlay(tk.Toplevel):
         x = self.winfo_x() + (event.x - self._drag_x)
         y = self.winfo_y() + (event.y - self._drag_y)
         self.geometry(f"+{x}+{y}")
+
+    def _end_drag(self, event):
+        # Resume corner-avoidance from whichever corner is now closest.
+        self.current_corner = self._nearest_corner(self.winfo_x(), self.winfo_y())
+
+    # --- cursor avoidance --------------------------------------------------
+    def _avoid_cursor(self):
+        try:
+            mx, my = mouse.get_position()
+            x, y = self.winfo_x(), self.winfo_y()
+            w, h = self.winfo_width(), self.winfo_height()
+            margin = self.AVOID_MARGIN
+
+            near = (x - margin <= mx <= x + w + margin and
+                    y - margin <= my <= y + h + margin)
+
+            if near:
+                positions = self._corner_positions()
+                # Move to whichever corner puts the most distance between
+                # its centre and the cursor.
+                farthest = max(
+                    positions.items(),
+                    key=lambda kv: _distance(mx, my, kv[1][0] + w / 2, kv[1][1] + h / 2),
+                )[0]
+                if farthest != self.current_corner:
+                    self._place_corner(farthest)
+        except Exception:
+            pass
+
+        self.after(self.AVOID_POLL_MS, self._avoid_cursor)
 
     def set_status(self, state, detail=None):
         color = self.COLORS.get(state, "#888888")
